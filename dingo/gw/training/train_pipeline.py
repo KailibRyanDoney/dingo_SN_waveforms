@@ -36,6 +36,23 @@ def copy_files_to_local(
 ) -> str:
     """
     Copy files to local node if local_dir is provided to minimize network traffic during training.
+    
+    Parameters
+    ----------
+    file_path: str
+        Path to file that should be copied.
+    local_dir: Optional[str]
+        Directory where file should be copied. If None, file will not be copied.
+    leave_keys_on_disk: bool
+        Whether to leave keys on disk and load them during training. If dataset is not copied and
+        leave_keys_on_disk is True, a warning will be raised.
+    is_condor: bool
+        Whether this is a condor job.
+
+    Returns
+    -------
+    local_file_path: str
+        Modified file path if file was copied to local node, else the original file path.
     """
     local_file_path = file_path
     if local_dir is not None:
@@ -84,7 +101,24 @@ def prepare_training_new(
     train_settings: dict, train_dir: str, local_settings: dict, waveform_model: Optional[str] = None
 ) -> Tuple[BasePosteriorModel, WaveformDataset]:
     """
-    Initialize WaveformDataset and PosteriorModel for a NEW run, with an explicit waveform model.
+    Based on a settings dictionary, initialize a WaveformDataset and PosteriorModel.
+
+    For model type 'nsf+embedding' (the only acceptable type at this point) this also
+    initializes the embedding network projection stage with SVD V matrices based on
+    clean detector waveforms.
+
+    Parameters
+    ----------
+    train_settings : dict
+        Settings which ultimately come from train_settings.yaml file.
+    train_dir : str
+        This is only used to save diagnostics from the SVD.
+    local_settings : dict
+        Local settings (e.g., num_workers, device)
+
+    Returns
+    -------
+    (BasePosteriorModel, WaveformDataset)
     """
     data_settings = deepcopy(train_settings["data"])
 
@@ -104,13 +138,16 @@ def prepare_training_new(
     wfd = build_dataset(
         data_settings=data_settings,
         leave_waveforms_on_disk=local_settings.get("leave_waveforms_on_disk", True),
-        # Optional: some implementations accept this explicitly
+        # okay hold on with this one ###############################
         waveform_model=resolved_model,
     )
     initial_weights = {}
+    
+    # The embedding network is assumed to have an SVD projection layer. If other types
+    # of embedding networks are added in the future, update this code.
 
-    # Optional SVD seeding for embedding network — computed for THIS waveform model
     if train_settings["model"].get("embedding_kwargs", None):
+        # First, build the SVD for seeding the embedding network.
         print("\nBuilding SVD for initialization of embedding network.")
         initial_weights["V_rb_list"] = build_svd_for_embedding_network(
             wfd,
@@ -119,25 +156,33 @@ def prepare_training_new(
             num_workers=local_settings["num_workers"],
             batch_size=train_settings["training"]["stage_0"]["batch_size"],
             out_dir=train_dir,
-            waveform_model=resolved_model,  # NEW
+            waveform_model=resolved_model,  # NEW ##########################
             **train_settings["model"]["embedding_kwargs"]["svd"],
         )
+
+    # Now set the transforms for training. We need to do this here so that we can (a)
+    # get the data dimensions to configure the network, and (b) save the
+    # parameter standardization dict in the PosteriorModel. In principle, (a) could
+    # be done without generating data (by careful calculation) and (b) could also
+    # be done outside the transform setup. But for now, this is convenient. The
+    # transforms will be reset later by initialize_stage().
 
     # Set initial transforms (model-aware)
     set_train_transforms(
         wfd,
         train_settings["data"],
         train_settings["training"]["stage_0"]["asd_dataset_path"],
-        waveform_model=resolved_model,  # NEW
+        waveform_model=resolved_model,  # NEW##########################
     )
 
+    # This modifies the model settings in-place.
     # Configure model from a representative sample of THIS dataset/model
     autocomplete_model_kwargs(train_settings["model"], wfd[0])
 
     full_settings = {
         "dataset_settings": wfd.settings,
         "train_settings": train_settings,
-        "waveform_model": resolved_model,  # persist in metadata for resume
+        "waveform_model": resolved_model,  # persist in metadata for resume ##############
     }
 
     print("\nInitializing new posterior model.")
@@ -169,12 +214,27 @@ def prepare_training_resume(
     checkpoint_name: str, local_settings: dict, train_dir: str, waveform_model: Optional[str] = None
 ) -> Tuple[BasePosteriorModel, WaveformDataset]:
     """
-    Load PosteriorModel and WaveformDataset from a checkpoint (resume) and ensure waveform model is resolved.
+    Loads a PosteriorModel from a checkpoint, as well as the corresponding
+    WaveformDataset, in order to continue training. It initializes the saved optimizer
+    and scheduler from the checkpoint.
+
+    Parameters
+    ----------
+    checkpoint_name : str
+        File name containing the checkpoint (.pt format).
+    local_settings : dict
+        Local settings (e.g., num_workers, device)
+    train_dir: str
+        Path to training directory where the wandb info is saved.
+
+    Returns
+    -------
+    (BasePosteriorModel, WaveformDataset)
     """
+    
     pm = build_model_from_kwargs(
         filename=checkpoint_name, device=local_settings["device"]
-    )
-
+    )#####################################
     data_settings = deepcopy(pm.metadata["train_settings"]["data"])
 
     # Resolve waveform model (CLI > settings > checkpoint metadata)
@@ -182,7 +242,7 @@ def prepare_training_resume(
         waveform_model, data_settings, fallback_meta=pm.metadata.get("waveform_model")
     )
     data_settings["waveform_model"] = resolved_model
-
+    ########################################
     # Optionally copy files to local and update path
     data_settings["waveform_dataset_path"] = copy_files_to_local(
         file_path=data_settings["waveform_dataset_path"],
@@ -194,7 +254,7 @@ def prepare_training_resume(
     wfd = build_dataset(
         data_settings=data_settings,
         leave_waveforms_on_disk=local_settings.get("leave_waveforms_on_disk", True),
-        waveform_model=resolved_model,  # NEW
+        waveform_model=resolved_model,  # NEW ##############################
     )
 
     if local_settings.get("wandb", False):
@@ -208,11 +268,12 @@ def prepare_training_resume(
             )
         except ImportError:
             print("WandB is enabled but not installed.")
-
+            
+    ########################################################
     # Ensure the model metadata contains waveform_model for future resumes
     if "waveform_model" not in pm.metadata or pm.metadata["waveform_model"] != resolved_model:
         if hasattr(pm, "metadata"):
-            pm.metadata["waveform_model"] = resolved_model
+            pm.metadata["waveform_model"] = resolved_model #######################
 
     return pm, wfd
 
@@ -225,8 +286,29 @@ def initialize_stage(
     resume: bool = False,
 ):
     """
-    Initialize stage: transforms, loaders, (optionally) optimizer/scheduler, and RB layer freeze, model-aware.
+    Initializes training based on PosteriorModel metadata and current stage:
+        * Builds transforms (based on noise settings for current stage);
+        * Builds DataLoaders;
+        * At the beginning of a stage (i.e., if not resuming mid-stage), initializes
+        a new optimizer and scheduler;
+        * Freezes / unfreezes SVD layer of embedding network
+
+    Parameters
+    ----------
+    pm : BasePosteriorModel
+    wfd : WaveformDataset
+    stage : dict
+        Settings specific to current stage of training
+    num_workers : int
+    resume : bool
+        Whether training is resuming mid-stage. This controls whether the optimizer and
+        scheduler should be re-initialized based on contents of stage dict.
+
+    Returns
+    -------
+    (train_loader, test_loader)
     """
+    
     train_settings = pm.metadata["train_settings"]
     waveform_model = pm.metadata.get("waveform_model") or train_settings["data"].get("waveform_model")
     if not waveform_model:
@@ -237,7 +319,7 @@ def initialize_stage(
         wfd,
         train_settings["data"],
         stage["asd_dataset_path"],
-        waveform_model=waveform_model,  # NEW
+        waveform_model=waveform_model,  # NEW ############################
     )
 
     # Allows for changes in batch size between stages.
@@ -249,7 +331,8 @@ def initialize_stage(
     )
 
     if not resume:
-        # New optimizer and scheduler. If we are resuming, these should have been loaded from the checkpoint.
+        # New optimizer and scheduler. If we are resuming, these should have been
+        # loaded from the checkpoint.
         print("Initializing new optimizer and scheduler.")
         pm.optimizer_kwargs = stage["optimizer"]
         pm.scheduler_kwargs = stage["scheduler"]
@@ -276,8 +359,24 @@ def train_stages(
     pm: BasePosteriorModel, wfd: WaveformDataset, train_dir: str, local_settings: dict
 ) -> bool:
     """
-    Train the network, iterating through the sequence of stages.
+    Train the network, iterating through the sequence of stages. Stages can change
+    certain settings such as the noise characteristics, optimizer, and scheduler settings.
+
+    Parameters
+    ----------
+    pm : BasePosteriorModel
+    wfd : WaveformDataset
+    train_dir : str
+        Directory for saving checkpoints and train history.
+    local_settings : dict
+
+    Returns
+    -------
+    bool
+        True if all stages are complete
+        False otherwise
     """
+    
     train_settings = pm.metadata["train_settings"]
     runtime_limits = RuntimeLimits(
         epoch_start=pm.epoch, **local_settings["runtime_limits"]
@@ -409,7 +508,10 @@ def train_local():
         with open(args.settings_file, "r") as fp:
             train_settings = yaml.safe_load(fp)
 
-        # Extract the local settings from train settings file, save it separately.
+        # Extract the local settings from train settings file, save it separately. This
+        # file can later be modified, and the settings take effect immediately upon
+        # resuming.
+        
         local_settings = train_settings.pop("local")
         with open(os.path.join(args.train_dir, "local_settings.yaml"), "w") as f:
             if (
