@@ -1,5 +1,6 @@
 data:
   waveform_dataset_path: training_data/waveform_dataset.hdf5  # Contains intrinsic waveforms
+  waveform_model: IMRPhenomXPHM
   train_fraction: 0.95
   window:  # Needed to calculate window factor for simulated data
     type: tukey
